@@ -1116,6 +1116,229 @@ class TestAttributeHandlers(unittest.TestCase):
         self.assertEqual(function(self.d), None)
 
 
+class TestRestrictedBuiltins(unittest.TestCase):
+    """
+    CVE-2026-34444 / GHSA-69v7-xpr6-6gjm: the attribute_filter and
+    attribute_handlers must not be bypassable through the attribute access
+    functions in python.builtins (getattr, setattr, ...).
+    """
+    class X(object):
+        a = 0
+        a1 = 1
+        _a = 2
+
+        def method(self):
+            return 'called'
+
+    def attr_filter(self, obj, name, is_setting):
+        if isinstance(name, unicode_type):
+            if not name.startswith('_'):
+                return name
+        raise AttributeError('denied')
+
+    def setUp(self):
+        self.lua = lupa.LuaRuntime(register_eval=False, attribute_filter=self.attr_filter)
+        self.x = self.X()
+
+    def tearDown(self):
+        self.lua = None
+        gc.collect()
+
+    def test_getattr_builtin_exploit_chain(self):
+        # Walk from a harmless object to the module globals and the "os" module.
+        exploit_code = '''
+            function(obj)
+                local getattr = python.builtins.getattr
+                local func = getattr(getattr(obj, 'method'), '__func__')
+                local module_globals = getattr(func, '__globals__')
+                return module_globals.sys.modules.os
+            end
+        '''
+        import os
+        unrestricted = lupa.LuaRuntime(register_eval=False)
+        self.assertTrue(unrestricted.eval(exploit_code)(self.x) is os)
+
+        exploit = self.lua.eval(exploit_code)
+        self.assertRaises(AttributeError, exploit, self.x)
+
+    def test_getattr_builtin(self):
+        getattr_ = self.lua.eval('function(obj, name) return python.builtins.getattr(obj, name) end')
+        self.assertEqual(0, getattr_(self.x, 'a'))
+        self.assertRaises(AttributeError, getattr_, self.x, '_a')
+        self.assertRaises(AttributeError, getattr_, self.x, '__class__')
+        self.assertRaises(AttributeError, getattr_, self.x, '__dict__')
+        self.assertRaises(AttributeError, getattr_, self.x, 'missing')
+
+    def test_getattr_builtin_default(self):
+        getattr_ = self.lua.eval(
+            'function(obj, name) return python.builtins.getattr(obj, name, "default") end')
+        self.assertEqual(0, getattr_(self.x, 'a'))
+        self.assertEqual('default', getattr_(self.x, '_a'))
+        self.assertEqual('default', getattr_(self.x, '__class__'))
+        self.assertEqual('default', getattr_(self.x, 'missing'))
+
+    def test_getattr_builtin_uses_filtered_name(self):
+        X = self.X
+
+        def renaming_filter(obj, name, is_setting):
+            if isinstance(name, unicode_type) and not name.startswith('_'):
+                return name + '1' if isinstance(obj, X) else name
+            raise AttributeError('denied')
+
+        lua = lupa.LuaRuntime(attribute_filter=renaming_filter)
+        self.assertEqual(1, lua.eval('(...).a', self.x))
+        self.assertEqual(1, lua.eval('python.builtins.getattr(...)', self.x, 'a'))
+        self.assertRaises(AttributeError, lua.eval, 'python.builtins.getattr(...)', self.x, '_a')
+
+    def test_hasattr_builtin(self):
+        hasattr_ = self.lua.eval('function(obj, name) return python.builtins.hasattr(obj, name) end')
+        self.assertEqual(True, hasattr_(self.x, 'a'))
+        self.assertEqual(False, hasattr_(self.x, '_a'))
+        self.assertEqual(False, hasattr_(self.x, '__class__'))
+        self.assertEqual(False, hasattr_(self.x, 'missing'))
+
+    def test_setattr_builtin(self):
+        setattr_ = self.lua.eval(
+            'function(obj, name, value) python.builtins.setattr(obj, name, value) end')
+        self.assertRaises(AttributeError, setattr_, self.x, '_a', 99)
+        self.assertEqual(2, self.x._a)
+        self.assertRaises(AttributeError, setattr_, self.x, '__class__', self.X)
+
+        setattr_(self.x, 'a', 5)
+        self.assertEqual(5, self.x.a)
+
+    def test_delattr_builtin(self):
+        delattr_ = self.lua.eval('function(obj, name) python.builtins.delattr(obj, name) end')
+        self.x._b = 1
+        self.assertRaises(AttributeError, delattr_, self.x, '_b')
+        self.assertEqual(1, self.x._b)
+
+        self.x.b = 1
+        delattr_(self.x, 'b')
+        self.assertFalse(hasattr(self.x, 'b'))
+
+    def test_vars_builtin(self):
+        self.x._secret = 'secret'
+        vars_ = self.lua.eval('function(obj) return python.builtins.vars(obj) end')
+        self.assertRaises(AttributeError, vars_, self.x)
+        # vars() without arguments would return the locals of the calling Python frame
+        self.assertRaises(TypeError, self.lua.eval, 'python.builtins.vars()')
+
+    def test_code_execution_builtins_removed(self):
+        builtins_ = self.lua.eval('python.builtins')
+        for name in ['eval', 'exec', 'execfile', 'compile', 'globals', 'locals', 'breakpoint']:
+            self.assertFalse(hasattr(builtins_, name), name)
+            self.assertEqual(
+                'missing', self.lua.eval('python.builtins.getattr(python.builtins, ..., "missing")', name))
+
+        exploit = self.lua.eval('''
+            function() return python.builtins.eval("__import__('os').getcwd()") end
+        ''')
+        self.assertRaises(AttributeError, exploit)
+        exploit = self.lua.eval('function() return python.builtins.globals().sys.modules.os end')
+        self.assertRaises(AttributeError, exploit)
+
+    def test_other_builtins_still_available(self):
+        self.assertEqual('4', self.lua.eval('python.builtins.str(4)'))
+        self.assertEqual(3, self.lua.eval('python.builtins.len(...)', [1, 2, 3]))
+        self.assertTrue(self.lua.eval('python.builtins.isinstance(...)', self.x, self.X))
+
+    def test_cython_function_globals_blocked(self):
+        # Lupa's own functions are Cython binding functions with a "func_globals" attribute
+        # that leads to the lupa module globals, and thus to an unrestricted LuaRuntime.
+        exploit_code = '''
+            function()
+                local cls = python.builtins.type({})
+                return python.as_attrgetter(cls).keys.func_globals
+            end
+        '''
+        unrestricted = lupa.LuaRuntime()
+        self.assertTrue(unrestricted.eval(exploit_code)()['LuaRuntime'] is lupa.LuaRuntime)
+
+        self.assertRaises(AttributeError, self.lua.eval(exploit_code))
+
+        exploit = self.lua.eval('''
+            function()
+                local method = python.builtins.getattr(function() end, 'coroutine')
+                return method.func_globals
+            end
+        ''')
+        self.assertRaises(AttributeError, exploit)
+        exploit = self.lua.eval('''
+            function()
+                local method = python.builtins.getattr(function() end, 'coroutine')
+                return python.builtins.getattr(method, 'func_globals')
+            end
+        ''')
+        self.assertRaises(AttributeError, exploit)
+
+    def test_generator_frame_globals_blocked(self):
+        def gen():
+            yield 1
+
+        exploit_code = 'function(g) return g.gi_frame.f_globals end'
+        unrestricted = lupa.LuaRuntime()
+        self.assertTrue(unrestricted.eval(exploit_code)(gen()) is globals())
+
+        self.assertRaises(AttributeError, self.lua.eval(exploit_code), gen())
+        exploit = self.lua.eval('''
+            function(g) return python.builtins.getattr(g, 'gi_frame') end
+        ''')
+        self.assertRaises(AttributeError, exploit, gen())
+
+    def test_restricted_introspection_attributes_cannot_be_set(self):
+        class Y(object):
+            func_code = 1
+
+        y = Y()
+        func = self.lua.eval('function(obj) obj.func_code = 2 end')
+        self.assertRaises(AttributeError, func, y)
+        func = self.lua.eval('function(obj) python.builtins.setattr(obj, "func_code", 2) end')
+        self.assertRaises(AttributeError, func, y)
+        self.assertEqual(1, y.func_code)
+
+    def test_attribute_handlers_apply_to_builtins(self):
+        def getter(obj, name):
+            if isinstance(name, unicode_type) and not name.startswith('_'):
+                return getattr(obj, name)
+            raise AttributeError('denied')
+
+        def setter(obj, name, value):
+            raise AttributeError('read-only')
+
+        lua = lupa.LuaRuntime(attribute_handlers=(getter, setter))
+        self.assertEqual(0, lua.eval('python.builtins.getattr(...)', self.x, 'a'))
+        self.assertRaises(AttributeError, lua.eval, 'python.builtins.getattr(...)', self.x, '__class__')
+        self.assertRaises(AttributeError, lua.eval, 'python.builtins.setattr(...)', self.x, 'a', 5)
+        self.assertEqual(0, self.x.a)
+        self.x.b = 1
+        self.assertRaises(AttributeError, lua.eval, 'python.builtins.delattr(...)', self.x, 'b')
+        self.assertEqual(1, self.x.b)
+        self.assertRaises(AttributeError, lua.eval, 'python.builtins.eval("1+1")')
+
+    def test_restricted_builtins_cannot_be_instantiated(self):
+        restricted_getattr = self.lua.eval('python.builtins.getattr')
+        func_type = type(restricted_getattr)
+        self.assertRaises(TypeError, func_type)
+        self.assertRaises(TypeError, func_type.__new__(func_type), self.x, '_a')
+        self.assertRaises(
+            TypeError, self.lua.eval, 'python.builtins.type(python.builtins.getattr)()')
+
+    def test_unrestricted_runtime_keeps_builtins(self):
+        try:
+            import __builtin__ as builtins
+        except ImportError:
+            import builtins
+
+        for lua in [lupa.LuaRuntime(), lupa.LuaRuntime(attribute_handlers=(None, None))]:
+            self.assertTrue(lua.eval('python.builtins') is builtins)
+            self.assertEqual(2, lua.eval('python.builtins.getattr(...)', self.x, '_a'))
+
+    def test_restricted_builtins_disabled(self):
+        lua = lupa.LuaRuntime(attribute_filter=self.attr_filter, register_builtins=False)
+        self.assertEqual(True, lua.eval('python.builtins == nil'))
+
+
 class TestPythonObjectsInLua(SetupLuaRuntimeMixin, unittest.TestCase):
     def test_explicit_python_function(self):
         lua_func = self.lua.eval(

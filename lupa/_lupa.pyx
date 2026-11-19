@@ -167,9 +167,27 @@ cdef class LuaRuntime:
       ``func(obj, attr_name, value)`` and may raise an ``AttributeError``.
       The return value of the setter is unused.  (New in Lupa 1.0)
 
+      When an ``attribute_filter`` or ``attribute_handlers`` are used,
+      the non-underscore introspection attributes of functions, generators,
+      coroutines, frames and tracebacks that lead to Python globals, frames
+      and code (``func_globals``, ``func_closure``, ``func_code``,
+      ``func_dict``, ``gi_frame``, ``gi_code``, ``cr_frame``, ``cr_code``,
+      ``ag_frame``, ``ag_code``, ``tb_frame``, ``f_globals``, ``f_locals``,
+      ``f_builtins``, ``f_back``) are always rejected with an
+      ``AttributeError``.  Also, ``python.builtins`` then provides
+      ``getattr()``, ``hasattr()``, ``setattr()``, ``delattr()`` and
+      ``vars()`` functions that apply the same restrictions as direct
+      attribute access from Lua code, and lacks the functions ``eval()``,
+      ``exec()``, ``execfile()``, ``compile()``, ``globals()``, ``locals()``
+      and ``breakpoint()``.  Other builtins such as ``__import__()`` and
+      ``open()`` remain available and must be restricted by the filter.
+      See https://github.com/scoder/lupa/security/advisories/GHSA-69v7-xpr6-6gjm
+
     * ``register_eval``: should Python's ``eval()`` function be available
       to Lua code as ``python.eval()``?  Note that this does not remove it
-      from the builtins.  Use an ``attribute_filter`` function for that.
+      from the builtins unless an ``attribute_filter`` or
+      ``attribute_handlers`` are used.  ``python.eval()`` itself is not
+      restricted by them.
       (default: True)
 
     * ``register_builtins``: should Python's builtins be available to Lua
@@ -450,7 +468,11 @@ cdef class LuaRuntime:
         if register_eval:
             self.register_py_object(b'eval',     b'eval', eval)
         if register_builtins:
-            self.register_py_object(b'builtins', b'builtins', builtins)
+            if restricts_attribute_access(self):
+                # The builtins for attribute access must not bypass the restrictions.
+                self.register_py_object(b'builtins', b'builtins', new_restricted_builtins(self))
+            else:
+                self.register_py_object(b'builtins', b'builtins', builtins)
 
         return 0  # nothing left to return on the stack
 
@@ -1557,6 +1579,84 @@ cdef int py_object_str(lua_State* L) nogil:
 #   Note that when getattr() is used, attribute_filter from LuaRuntime
 #   may mediate access.  attribute_filter does not come into play when
 #   using the getitem method of access.
+#
+#   If attribute_filter or attribute_handlers are set, the getattr(),
+#   hasattr(), setattr(), delattr() and vars() functions in python.builtins
+#   apply the same restrictions, and the introspection attributes in
+#   RESTRICTED_INTROSPECTION_ATTRIBUTES are rejected.
+#   See https://github.com/scoder/lupa/security/advisories/GHSA-69v7-xpr6-6gjm
+
+# Attribute names without leading underscores that lead from functions,
+# generators, coroutines, tracebacks and frames to Python globals, frames
+# and code.  Lupa's own functions are compiled with "binding=True", which
+# provides "func_globals" etc. (as do all Python 2 functions), so an
+# attribute_filter that only rejects "_" names cannot prevent them.
+cdef frozenset RESTRICTED_INTROSPECTION_ATTRIBUTES = frozenset([
+    u'func_globals', u'func_closure', u'func_code', u'func_dict',
+    u'gi_frame', u'gi_code', u'cr_frame', u'cr_code', u'ag_frame', u'ag_code',
+    u'tb_frame', u'f_globals', u'f_locals', u'f_builtins', u'f_back',
+])
+
+# Builtins that execute Python code or expose the Python globals/locals
+# and are removed from python.builtins if attribute access is restricted.
+cdef tuple UNSAFE_BUILTINS = (
+    'eval', 'exec', 'execfile', 'compile', 'globals', 'locals', 'breakpoint',
+    '__builtins__',
+)
+
+cdef inline bint restricts_attribute_access(LuaRuntime runtime):
+    return (runtime._attribute_filter is not None or
+            runtime._attribute_getter is not None or
+            runtime._attribute_setter is not None)
+
+cdef int check_restricted_attribute_name(LuaRuntime runtime, attr_name) except -1:
+    if isinstance(attr_name, bytes):
+        try:
+            attr_name = (<bytes>attr_name).decode(runtime._source_encoding)
+        except UnicodeDecodeError:
+            return 0
+    if isinstance(attr_name, unicode) and attr_name in RESTRICTED_INTROSPECTION_ATTRIBUTES:
+        raise AttributeError("access to attribute '%s' is not allowed" % attr_name)
+    return 0
+
+cdef object restricted_getattr(LuaRuntime runtime, obj, attr_name):
+    if runtime._attribute_getter is not None:
+        check_restricted_attribute_name(runtime, attr_name)
+        return runtime._attribute_getter(obj, attr_name)
+    if runtime._attribute_filter is not None:
+        attr_name = runtime._attribute_filter(obj, attr_name, False)
+    if isinstance(attr_name, bytes):
+        attr_name = (<bytes>attr_name).decode(runtime._source_encoding)
+    if restricts_attribute_access(runtime):
+        check_restricted_attribute_name(runtime, attr_name)
+    return getattr(obj, attr_name)
+
+cdef int restricted_setattr(LuaRuntime runtime, obj, attr_name, attr_value) except -1:
+    if runtime._attribute_setter is not None:
+        check_restricted_attribute_name(runtime, attr_name)
+        runtime._attribute_setter(obj, attr_name, attr_value)
+        return 0
+    if runtime._attribute_filter is not None:
+        attr_name = runtime._attribute_filter(obj, attr_name, True)
+    if isinstance(attr_name, bytes):
+        attr_name = (<bytes>attr_name).decode(runtime._source_encoding)
+    if restricts_attribute_access(runtime):
+        check_restricted_attribute_name(runtime, attr_name)
+    setattr(obj, attr_name, attr_value)
+    return 0
+
+cdef int restricted_delattr(LuaRuntime runtime, obj, attr_name) except -1:
+    if runtime._attribute_setter is not None:
+        # attribute_handlers cannot mediate the deletion of attributes
+        raise AttributeError("deleting attributes is not allowed with attribute_handlers")
+    if runtime._attribute_filter is not None:
+        attr_name = runtime._attribute_filter(obj, attr_name, True)
+    if isinstance(attr_name, bytes):
+        attr_name = (<bytes>attr_name).decode(runtime._source_encoding)
+    if restricts_attribute_access(runtime):
+        check_restricted_attribute_name(runtime, attr_name)
+    delattr(obj, attr_name)
+    return 0
 
 cdef int getitem_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, int key_n) except -1:
     return py_to_lua(runtime, L,
@@ -1569,28 +1669,118 @@ cdef int setitem_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, in
 cdef int getattr_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, int key_n) except -1:
     obj = <object>py_obj.obj
     attr_name = py_from_lua(runtime, L, key_n)
-    if runtime._attribute_getter is not None:
-        value = runtime._attribute_getter(obj, attr_name)
-        return py_to_lua(runtime, L, value)
-    if runtime._attribute_filter is not None:
-        attr_name = runtime._attribute_filter(obj, attr_name, False)
-    if isinstance(attr_name, bytes):
-        attr_name = (<bytes>attr_name).decode(runtime._source_encoding)
-    return py_to_lua(runtime, L, getattr(obj, attr_name))
+    return py_to_lua(runtime, L, restricted_getattr(runtime, obj, attr_name))
 
 cdef int setattr_for_lua(LuaRuntime runtime, lua_State* L, py_object* py_obj, int key_n, int value_n) except -1:
     obj = <object>py_obj.obj
     attr_name = py_from_lua(runtime, L, key_n)
     attr_value = py_from_lua(runtime, L, value_n)
-    if runtime._attribute_setter is not None:
-        runtime._attribute_setter(obj, attr_name, attr_value)
-    else:
-        if runtime._attribute_filter is not None:
-            attr_name = runtime._attribute_filter(obj, attr_name, True)
-        if isinstance(attr_name, bytes):
-            attr_name = (<bytes>attr_name).decode(runtime._source_encoding)
-        setattr(obj, attr_name, attr_value)
-    return 0
+    return restricted_setattr(runtime, obj, attr_name, attr_value)
+
+
+# Replacements for the attribute access builtins in a restricted LuaRuntime.
+# These are not (Cython binding) functions, which would expose the module
+# globals through their attributes, and cannot be instantiated from Python.
+
+cdef enum:
+    RESTRICTED_GETATTR = 1
+    RESTRICTED_HASATTR = 2
+    RESTRICTED_SETATTR = 3
+    RESTRICTED_DELATTR = 4
+    RESTRICTED_VARS = 5
+
+
+@cython.final
+@cython.internal
+@cython.no_gc_clear
+@cython.auto_pickle(False)
+cdef class _RestrictedAttributeBuiltin:
+    """A builtin attribute access function that applies the
+    attribute_filter / attribute_handlers of a LuaRuntime.
+    """
+    cdef LuaRuntime _runtime
+    cdef int _kind
+    cdef object _name
+
+    def __init__(self):
+        raise TypeError("Type cannot be instantiated from Python")
+
+    def __repr__(self):
+        return "<restricted built-in function %s>" % self._name
+
+    def __call__(self, *args):
+        cdef LuaRuntime runtime = self._runtime
+        if runtime is None:
+            raise TypeError("restricted builtin function is not initialised")
+        cdef Py_ssize_t nargs = len(args)
+
+        if self._kind == RESTRICTED_GETATTR:
+            if nargs == 2:
+                return restricted_getattr(runtime, args[0], args[1])
+            elif nargs == 3:
+                try:
+                    return restricted_getattr(runtime, args[0], args[1])
+                except AttributeError:
+                    return args[2]
+            raise TypeError("getattr expected 2 or 3 arguments, got %d" % nargs)
+
+        elif self._kind == RESTRICTED_HASATTR:
+            if nargs != 2:
+                raise TypeError("hasattr expected 2 arguments, got %d" % nargs)
+            try:
+                restricted_getattr(runtime, args[0], args[1])
+            except AttributeError:
+                return False
+            return True
+
+        elif self._kind == RESTRICTED_SETATTR:
+            if nargs != 3:
+                raise TypeError("setattr expected 3 arguments, got %d" % nargs)
+            restricted_setattr(runtime, args[0], args[1], args[2])
+            return None
+
+        elif self._kind == RESTRICTED_DELATTR:
+            if nargs != 2:
+                raise TypeError("delattr expected 2 arguments, got %d" % nargs)
+            restricted_delattr(runtime, args[0], args[1])
+            return None
+
+        elif self._kind == RESTRICTED_VARS:
+            if nargs != 1:
+                # vars() without argument would return the locals of the calling Python frame
+                raise TypeError("vars expected 1 argument, got %d" % nargs)
+            return restricted_getattr(runtime, args[0], u'__dict__')
+
+        raise TypeError("unknown restricted builtin function")
+
+
+cdef _RestrictedAttributeBuiltin new_restricted_attribute_builtin(LuaRuntime runtime, int kind, name):
+    cdef _RestrictedAttributeBuiltin func = _RestrictedAttributeBuiltin.__new__(_RestrictedAttributeBuiltin)
+    func._runtime = runtime
+    func._kind = kind
+    func._name = name
+    return func
+
+
+cdef object new_restricted_builtins(LuaRuntime runtime):
+    """
+    Create a copy of the builtins module for a LuaRuntime that restricts
+    attribute access, in which the attribute access functions apply the
+    same restrictions as attribute access from Lua code, and which lacks
+    the functions that execute Python code or expose the Python globals.
+    """
+    restricted_builtins = type(builtins)(builtins.__name__)
+    namespace = restricted_builtins.__dict__
+    namespace.update(builtins.__dict__)
+    for name in UNSAFE_BUILTINS:
+        namespace.pop(name, None)
+    for name, kind in (('getattr', RESTRICTED_GETATTR),
+                       ('hasattr', RESTRICTED_HASATTR),
+                       ('setattr', RESTRICTED_SETATTR),
+                       ('delattr', RESTRICTED_DELATTR),
+                       ('vars', RESTRICTED_VARS)):
+        namespace[name] = new_restricted_attribute_builtin(runtime, kind, name)
+    return restricted_builtins
 
 
 cdef int py_object_getindex_with_gil(lua_State* L, py_object* py_obj) with gil:
